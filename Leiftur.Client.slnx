@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Leiftur.Client/Leiftur.Client.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Leiftur.Client.Tests/Leiftur.Client.Tests.csproj" />
+  </Folder>
+</Solution>
