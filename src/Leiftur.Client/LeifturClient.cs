@@ -48,6 +48,51 @@ public interface ILeifturClient
     Task<PagedResult<MessageDto>> ListMessagesAsync(MessageQuery? query = null, CancellationToken cancellationToken = default);
 
     Task<UsageReport> GetUsageAsync(DateOnly from, DateOnly to, UsageGroupBy groupBy = UsageGroupBy.Day, Guid? projectId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>What the account owes for a month: the monthly fee plus what was sent. Before VAT.</summary>
+    /// <param name="year">The year, e.g. 2026.</param>
+    /// <param name="month">The month, 1-12.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    Task<BillingStatement> GetStatementAsync(int year, int month, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Stops sending to these numbers. Later sends skip them and report them back in
+    /// <see cref="SendSmsResponse.Suppressed"/>. Adding a number that is already listed is harmless.
+    /// </summary>
+    /// <param name="numbers">Up to 10,000 numbers, in any accepted format.</param>
+    /// <param name="reason">One of <see cref="SuppressionReasons"/>. Defaults to opt_out.</param>
+    /// <param name="note">Free text for your own records, up to 500 characters.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    Task<AddSuppressionsResponse> AddSuppressionsAsync(IEnumerable<string> numbers, string? reason = null, string? note = null, CancellationToken cancellationToken = default);
+
+    /// <summary>The suppression list, newest first.</summary>
+    Task<PagedResult<SuppressionDto>> ListSuppressionsAsync(int page = 1, int pageSize = 100, string? reason = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Returns the entry if the number is on the suppression list, otherwise null.</summary>
+    Task<SuppressionDto?> GetSuppressionAsync(string number, CancellationToken cancellationToken = default);
+
+    /// <summary>Allows sending to the number again. Returns false if it was not on the list.</summary>
+    Task<bool> RemoveSuppressionAsync(string number, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Registers an HTTPS address that receives message status events. The returned secret is shown only
+    /// once; keep it to verify incoming requests with <see cref="LeifturWebhook"/>.
+    /// </summary>
+    /// <param name="url">A public https:// address.</param>
+    /// <param name="events">Which of <see cref="WebhookEventTypes"/> to receive. Defaults to delivered and failed.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    Task<WebhookCreatedResponse> CreateWebhookAsync(string url, IEnumerable<string>? events = null, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<WebhookDto>> ListWebhooksAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Removes a webhook and any events still waiting for it. Returns false if it does not exist.</summary>
+    Task<bool> DeleteWebhookAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends a webhook.test event to the webhook's address.</summary>
+    Task<WebhookDeliveryDto> SendTestWebhookAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>The 100 most recent events for a webhook and how delivering each went.</summary>
+    Task<IReadOnlyList<WebhookDeliveryDto>> ListWebhookDeliveriesAsync(Guid id, CancellationToken cancellationToken = default);
 }
 
 public sealed record MessageQuery
@@ -151,6 +196,95 @@ public sealed class LeifturClient : ILeifturClient
         return await ReadAsync<UsageReport>(response, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<BillingStatement> GetStatementAsync(int year, int month, CancellationToken cancellationToken = default)
+    {
+        if (month is < 1 or > 12) throw new ArgumentOutOfRangeException(nameof(month), "Month must be 1-12.");
+        var url = $"v1/reports/statement?month={year.ToString("D4", CultureInfo.InvariantCulture)}-{month.ToString("D2", CultureInfo.InvariantCulture)}";
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, url), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<BillingStatement>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<AddSuppressionsResponse> AddSuppressionsAsync(IEnumerable<string> numbers, string? reason = null, string? note = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(numbers);
+        var body = new { numbers = numbers.ToList(), reason, note };
+        // Adding the same numbers twice changes nothing, so this is safe to retry.
+        var response = await SendWithRetryAsync(
+            () => new HttpRequestMessage(HttpMethod.Post, "v1/suppressions") { Content = JsonContent.Create(body, options: Json) }, cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<AddSuppressionsResponse>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<PagedResult<SuppressionDto>> ListSuppressionsAsync(int page = 1, int pageSize = 100, string? reason = null, CancellationToken cancellationToken = default)
+    {
+        var url = $"v1/suppressions?page={page}&pageSize={pageSize}";
+        if (!string.IsNullOrEmpty(reason)) url += $"&reason={Uri.EscapeDataString(reason)}";
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, url), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<PagedResult<SuppressionDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<SuppressionDto?> GetSuppressionAsync(string number, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(number);
+        return GetOrNullAsync<SuppressionDto>($"v1/suppressions/{Uri.EscapeDataString(number)}", cancellationToken);
+    }
+
+    public Task<bool> RemoveSuppressionAsync(string number, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(number);
+        return DeleteAsync($"v1/suppressions/{Uri.EscapeDataString(number)}", cancellationToken);
+    }
+
+    public async Task<WebhookCreatedResponse> CreateWebhookAsync(string url, IEnumerable<string>? events = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(url);
+        var body = new { url, events = events?.ToList() };
+        // Not retried: a second attempt after a lost answer would register the address twice.
+        var response = await SendWithRetryAsync(
+            () => new HttpRequestMessage(HttpMethod.Post, "v1/webhooks") { Content = JsonContent.Create(body, options: Json) }, cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<WebhookCreatedResponse>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<WebhookDto>> ListWebhooksAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, "v1/webhooks"), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<List<WebhookDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<bool> DeleteWebhookAsync(Guid id, CancellationToken cancellationToken = default) =>
+        DeleteAsync($"v1/webhooks/{id}", cancellationToken);
+
+    public async Task<WebhookDeliveryDto> SendTestWebhookAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        // Not retried: each call sends one more test event.
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Post, $"v1/webhooks/{id}/test"), cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<WebhookDeliveryDto>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<WebhookDeliveryDto>> ListWebhookDeliveriesAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, $"v1/webhooks/{id}/deliveries"), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<List<WebhookDeliveryDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>True if something was deleted, false if it was not there.</summary>
+    private async Task<bool> DeleteAsync(string url, CancellationToken ct)
+    {
+        // Deleting twice ends in the same state, so this is safe to retry.
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Delete, url), ct).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            response.Dispose();
+            return false;
+        }
+        if (response.IsSuccessStatusCode)
+        {
+            response.Dispose();
+            return true;
+        }
+        await ReadAsync<object>(response, ct).ConfigureAwait(false);   // throws LeifturApiException
+        return false;
+    }
+
     private async Task<T?> GetOrNullAsync<T>(string url, CancellationToken ct) where T : class
     {
         var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, url), ct).ConfigureAwait(false);
@@ -162,11 +296,12 @@ public sealed class LeifturClient : ILeifturClient
         return await ReadAsync<T>(response, ct).ConfigureAwait(false);
     }
 
-    private async Task<HttpResponseMessage> SendWithRetryAsync(Func<HttpRequestMessage> createRequest, CancellationToken ct)
+    private async Task<HttpResponseMessage> SendWithRetryAsync(Func<HttpRequestMessage> createRequest, CancellationToken ct, int? maxRetries = null)
     {
+        var retries = maxRetries ?? _options.MaxRetries;
         for (var attempt = 0; ; attempt++)
         {
-            var lastAttempt = attempt >= _options.MaxRetries;
+            var lastAttempt = attempt >= retries;
             TimeSpan? retryAfter = null;
             try
             {

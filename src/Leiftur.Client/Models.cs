@@ -24,6 +24,16 @@ public enum MessageStatus
     Unknown = 7,
 }
 
+/// <summary>What a price is charged per.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter<BillingUnit>))]
+public enum BillingUnit
+{
+    /// <summary>Per segment: a long message, or one with Icelandic letters, counts as several.</summary>
+    Segment = 0,
+    /// <summary>Per message, however many segments it takes.</summary>
+    Message = 1,
+}
+
 [JsonConverter(typeof(JsonStringEnumConverter<SmsEncoding>))]
 public enum SmsEncoding
 {
@@ -53,6 +63,12 @@ public sealed record SendSmsRequest
 
     /// <summary>Project (sub-account) to bill. Defaults to the project bound to the API key.</summary>
     public Guid? ProjectId { get; init; }
+
+    /// <summary>
+    /// Up to 10 key/value pairs of your own that are stored with each message and returned with it, also in
+    /// webhook events. Keys up to 40 characters, values up to 200.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? Metadata { get; init; }
 }
 
 public sealed record SendSmsResponse
@@ -67,6 +83,9 @@ public sealed record SendSmsResponse
 
     /// <summary>True when this response was replayed for a repeated Idempotency-Key.</summary>
     public bool Replayed { get; init; }
+
+    /// <summary>Recipients that were left out because they are on your suppression list. Not sent, not billed.</summary>
+    public IReadOnlyList<string> Suppressed { get; init; } = [];
 }
 
 public sealed record AcceptedMessage(Guid Id, string To, string CountryCode, int Segments, MessageStatus Status);
@@ -85,6 +104,8 @@ public sealed record MessageDto
     public required MessageStatus Status { get; init; }
     public string? Reference { get; init; }
     public IReadOnlyList<string> Tags { get; init; } = [];
+    /// <summary>The key/value pairs given when the message was sent.</summary>
+    public IReadOnlyDictionary<string, string> Metadata { get; init; } = new Dictionary<string, string>();
     public required decimal UnitPrice { get; init; }
     public required decimal Price { get; init; }
     public required string Currency { get; init; }

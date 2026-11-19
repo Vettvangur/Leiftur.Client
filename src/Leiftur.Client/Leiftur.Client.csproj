@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <PackageId>Leiftur.Client</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Vettvangur</Authors>
     <Description>.NET client for the Leiftur SMS API: send, schedule and track SMS messages.</Description>
     <PackageTags>sms;leiftur;iceland</PackageTags>
@@ -12,7 +12,7 @@
     <PackageProjectUrl>https://github.com/Vettvangur/Leiftur.Client</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Vettvangur/Leiftur.Client</RepositoryUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
