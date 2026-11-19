@@ -93,6 +93,63 @@ public interface ILeifturClient
 
     /// <summary>The 100 most recent events for a webhook and how delivering each went.</summary>
     Task<IReadOnlyList<WebhookDeliveryDto>> ListWebhookDeliveriesAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Stores a text for reuse. Placeholders are written {{name}}, or {{name|fallback}} to give a value to
+    /// use when a recipient has none. Send with it by setting <see cref="SendSmsRequest.TemplateId"/>.
+    /// </summary>
+    Task<TemplateDto> CreateTemplateAsync(string name, string body, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<TemplateDto>> ListTemplatesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Returns null when the template does not exist.</summary>
+    Task<TemplateDto?> GetTemplateAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>Changes a template. Messages already accepted keep the text they were accepted with.</summary>
+    Task<TemplateDto> UpdateTemplateAsync(Guid id, string name, string body, CancellationToken cancellationToken = default);
+
+    /// <summary>Returns false if the template does not exist.</summary>
+    Task<bool> DeleteTemplateAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>Shows a template filled in with the given values, and how many segments it would take. Sends nothing.</summary>
+    Task<TemplatePreview> PreviewTemplateAsync(Guid id, IReadOnlyDictionary<string, string>? data = null, CancellationToken cancellationToken = default);
+
+    Task<ContactListDto> CreateContactListAsync(string name, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<ContactListDto>> ListContactListsAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Deletes a list and every contact on it. Returns false if the list does not exist.</summary>
+    Task<bool> DeleteContactListAsync(Guid id, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Adds up to 10,000 contacts to a list. A number already on the list has its data replaced; it is never
+    /// listed twice.
+    /// </summary>
+    Task<AddContactsResponse> AddContactsAsync(Guid listId, IEnumerable<ContactInput> contacts, CancellationToken cancellationToken = default);
+
+    /// <summary>The contacts on a list, ordered by number.</summary>
+    Task<PagedResult<ContactDto>> ListContactsAsync(Guid listId, int page = 1, int pageSize = 100, CancellationToken cancellationToken = default);
+
+    /// <summary>Takes one number off a list. Returns false if it was not on it. This is not an opt-out; use the suppression list for that.</summary>
+    Task<bool> RemoveContactAsync(Guid listId, string number, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a verification code to a phone number. The code is not returned: check what the person typed
+    /// with <see cref="CheckVerificationAsync"/>. Not retried on failure, since a retry would send a second code.
+    /// </summary>
+    Task<VerificationDto> StartVerificationAsync(StartVerificationRequest request, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends a six-digit code, valid for five minutes, with the standard Icelandic text.</summary>
+    Task<VerificationDto> StartVerificationAsync(string to, string from, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Checks the code a person typed. Act on <see cref="VerificationCheckResult.Valid"/>. Each call uses one
+    /// of the five attempts, so it is not retried on failure.
+    /// </summary>
+    Task<VerificationCheckResult> CheckVerificationAsync(Guid id, string code, CancellationToken cancellationToken = default);
+
+    /// <summary>Returns null when the verification does not exist.</summary>
+    Task<VerificationDto?> GetVerificationAsync(Guid id, CancellationToken cancellationToken = default);
 }
 
 public sealed record MessageQuery
@@ -265,6 +322,102 @@ public sealed class LeifturClient : ILeifturClient
         var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, $"v1/webhooks/{id}/deliveries"), cancellationToken).ConfigureAwait(false);
         return await ReadAsync<List<WebhookDeliveryDto>>(response, cancellationToken).ConfigureAwait(false);
     }
+
+    public async Task<TemplateDto> CreateTemplateAsync(string name, string body, CancellationToken cancellationToken = default)
+    {
+        // Not retried: after a lost answer the name would already be taken, and the repeat would fail.
+        var response = await SendWithRetryAsync(() => Post("v1/templates", new { name, body }), cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<TemplateDto>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<TemplateDto>> ListTemplatesAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, "v1/templates"), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<List<TemplateDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<TemplateDto?> GetTemplateAsync(Guid id, CancellationToken cancellationToken = default) =>
+        GetOrNullAsync<TemplateDto>($"v1/templates/{id}", cancellationToken);
+
+    public async Task<TemplateDto> UpdateTemplateAsync(Guid id, string name, string body, CancellationToken cancellationToken = default)
+    {
+        // Saving the same content twice ends in the same state, so this is safe to retry.
+        var response = await SendWithRetryAsync(
+            () => new HttpRequestMessage(HttpMethod.Put, $"v1/templates/{id}") { Content = JsonContent.Create(new { name, body }, options: Json) }, cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<TemplateDto>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<bool> DeleteTemplateAsync(Guid id, CancellationToken cancellationToken = default) =>
+        DeleteAsync($"v1/templates/{id}", cancellationToken);
+
+    public async Task<TemplatePreview> PreviewTemplateAsync(Guid id, IReadOnlyDictionary<string, string>? data = null, CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(() => Post($"v1/templates/{id}/preview", new { data }), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<TemplatePreview>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<ContactListDto> CreateContactListAsync(string name, CancellationToken cancellationToken = default)
+    {
+        // Not retried, for the same reason as creating a template.
+        var response = await SendWithRetryAsync(() => Post("v1/lists", new { name }), cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<ContactListDto>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<ContactListDto>> ListContactListsAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(() => new HttpRequestMessage(HttpMethod.Get, "v1/lists"), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<List<ContactListDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<bool> DeleteContactListAsync(Guid id, CancellationToken cancellationToken = default) =>
+        DeleteAsync($"v1/lists/{id}", cancellationToken);
+
+    public async Task<AddContactsResponse> AddContactsAsync(Guid listId, IEnumerable<ContactInput> contacts, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(contacts);
+        var body = new { contacts = contacts.ToList() };
+        // Adding the same contacts twice ends in the same list, so this is safe to retry.
+        var response = await SendWithRetryAsync(() => Post($"v1/lists/{listId}/contacts", body), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<AddContactsResponse>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<PagedResult<ContactDto>> ListContactsAsync(Guid listId, int page = 1, int pageSize = 100, CancellationToken cancellationToken = default)
+    {
+        var response = await SendWithRetryAsync(
+            () => new HttpRequestMessage(HttpMethod.Get, $"v1/lists/{listId}/contacts?page={page}&pageSize={pageSize}"), cancellationToken).ConfigureAwait(false);
+        return await ReadAsync<PagedResult<ContactDto>>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<bool> RemoveContactAsync(Guid listId, string number, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(number);
+        return DeleteAsync($"v1/lists/{listId}/contacts/{Uri.EscapeDataString(number)}", cancellationToken);
+    }
+
+    public async Task<VerificationDto> StartVerificationAsync(StartVerificationRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        // Not retried: a second attempt after a lost answer would send the person a second code.
+        var response = await SendWithRetryAsync(() => Post("v1/verifications", request), cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<VerificationDto>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<VerificationDto> StartVerificationAsync(string to, string from, CancellationToken cancellationToken = default) =>
+        StartVerificationAsync(new StartVerificationRequest { To = to, From = from }, cancellationToken);
+
+    public async Task<VerificationCheckResult> CheckVerificationAsync(Guid id, string code, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(code);
+        // Not retried: each check uses up an attempt, and a repeat of a check that succeeded would come back as not valid.
+        var response = await SendWithRetryAsync(() => Post($"v1/verifications/{id}/check", new { code }), cancellationToken, maxRetries: 0).ConfigureAwait(false);
+        return await ReadAsync<VerificationCheckResult>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<VerificationDto?> GetVerificationAsync(Guid id, CancellationToken cancellationToken = default) =>
+        GetOrNullAsync<VerificationDto>($"v1/verifications/{id}", cancellationToken);
+
+    private static HttpRequestMessage Post<T>(string url, T body) =>
+        new(HttpMethod.Post, url) { Content = JsonContent.Create(body, options: Json) };
 
     /// <summary>True if something was deleted, false if it was not there.</summary>
     private async Task<bool> DeleteAsync(string url, CancellationToken ct)

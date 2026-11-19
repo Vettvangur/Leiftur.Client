@@ -10,6 +10,9 @@ Works in .NET 8 and later. You need a Leiftur account and an API key.
 - [Install and set up](#install-and-set-up)
 - [Send an SMS](#send-an-sms)
 - [Send to many recipients](#send-to-many-recipients)
+- [Personal messages and templates](#personal-messages-and-templates)
+- [Contact lists](#contact-lists)
+- [Verification codes](#verification-codes)
 - [Schedule and cancel](#schedule-and-cancel)
 - [Tag messages for billing](#tag-messages-for-billing)
 - [Never send twice](#never-send-twice)
@@ -117,6 +120,194 @@ foreach (var chunk in allNumbers.Chunk(10_000))
     await leiftur.SendAsync(new SendSmsRequest { From = "Acme", To = chunk, Body = text, Reference = "newsletter-47" });
 }
 ```
+
+## Personal messages and templates
+
+A text can contain placeholders that are filled in for each recipient.
+
+| Written as | Means |
+|---|---|
+| `{{name}}` | The recipient's value for `name`. If there is none, the send is refused. |
+| `{{name\|vinur}}` | The same, but use `vinur` when there is no value |
+
+```csharp
+var result = await leiftur.SendAsync(new SendSmsRequest
+{
+    From = "Acme",
+    Body = "Hæ {{name|vinur}}, pöntun {{order}} er tilbúin í {{store}}.",
+    Data = new Dictionary<string, string> { ["store"] = "Kringlunni" },      // the same for everyone
+    Recipients =
+    [
+        new SendRecipient("7801512", ("name", "Anna"), ("order", "1001")),
+        new SendRecipient("7801513", ("order", "1002"), ("store", "Smáralind")),   // a recipient's own value wins
+    ],
+});
+// 780 1512 receives: Hæ Anna, pöntun 1001 er tilbúin í Kringlunni.
+// 780 1513 receives: Hæ vinur, pöntun 1002 er tilbúin í Smáralind.
+```
+
+Things to know:
+
+- **A missing value stops the whole send.** If any recipient lacks a value that has no fallback, the request is
+  refused with a `LeifturApiException` (400) naming the recipient and the placeholder, and nothing is sent.
+  Give a fallback (`{{name|vinur}}`) wherever a value might be missing.
+- **A plain send is never altered.** Placeholders are only filled in when the request has `Data`,
+  `Recipients`, `TemplateId` or `ContactListId`. `SendAsync("Acme", "7801512", "Use {{name}} here")` arrives
+  exactly as written.
+- **Segments are counted per recipient.** A longer name, or one with an Icelandic letter, can change what a
+  message costs. `result.TotalSegments` and `result.Messages[i].Segments` have the real numbers.
+- **Personal messages go out more slowly.** Recipients who end up with the same text are sent together.
+  Recipients who each get a different text are sent one at a time, so a large personalised send takes much
+  longer than the same text to everyone.
+
+### Stored templates
+
+Keep a text on the server and refer to it by id, so it can be changed in one place without a new release of
+your application.
+
+```csharp
+TemplateDto template = await leiftur.CreateTemplateAsync("Order ready", "Hæ {{name|vinur}}, pöntun {{order}} er tilbúin.");
+Console.WriteLine(string.Join(", ", template.Fields));   // name, order
+
+// See it filled in, and what it costs, before sending anything:
+TemplatePreview preview = await leiftur.PreviewTemplateAsync(template.Id, new Dictionary<string, string> { ["order"] = "1001" });
+Console.WriteLine(preview.Body);       // Hæ vinur, pöntun 1001 er tilbúin.
+Console.WriteLine(preview.Segments);   // 1
+Console.WriteLine(preview.Missing.Count);   // 0: nothing is left unfilled
+
+await leiftur.SendAsync(new SendSmsRequest
+{
+    From = "Acme",
+    TemplateId = template.Id,
+    Recipients = [new SendRecipient("7801512", ("name", "Anna"), ("order", "1001"))],
+});
+```
+
+```csharp
+IReadOnlyList<TemplateDto> all = await leiftur.ListTemplatesAsync();
+TemplateDto? one = await leiftur.GetTemplateAsync(template.Id);            // null if it does not exist
+await leiftur.UpdateTemplateAsync(template.Id, "Order ready", "Pöntun {{order}} er tilbúin.");
+bool deleted = await leiftur.DeleteTemplateAsync(template.Id);
+```
+
+Template names are unique within your account. Changing a template does not affect messages already accepted.
+
+## Contact lists
+
+A named list of numbers, each with its own values for placeholders.
+
+```csharp
+ContactListDto list = await leiftur.CreateContactListAsync("Newsletter");
+
+AddContactsResponse added = await leiftur.AddContactsAsync(list.Id,
+[
+    new ContactInput("7801512", ("name", "Anna")),
+    new ContactInput("+354 780 1513", ("name", "Jón")),
+    new ContactInput("7801514"),
+]);
+Console.WriteLine($"{added.Added} added, {added.Updated} updated, {added.Invalid.Count} invalid");
+```
+
+- Up to 10,000 contacts per call. Valid ones are stored even if others in the same call are not; the rejected
+  inputs come back in `Invalid`.
+- Adding a number that is already on the list **replaces its data**. It is never listed twice.
+
+Send to everyone on the list:
+
+```csharp
+var result = await leiftur.SendAsync(new SendSmsRequest
+{
+    From = "Acme",
+    ContactListId = list.Id,
+    Body = "Hæ {{name|vinur}}, útsalan er byrjuð.",
+    Reference = "sale-november",
+});
+
+Console.WriteLine($"{result.TotalMessages} sent, {result.Suppressed.Count} skipped because they opted out");
+```
+
+Each contact's stored values fill the placeholders. People on your suppression list are skipped, as with any
+send. A list with more than 10,000 contacts cannot be sent to in one request.
+
+```csharp
+PagedResult<ContactDto> page = await leiftur.ListContactsAsync(list.Id, page: 1, pageSize: 100);
+IReadOnlyList<ContactListDto> lists = await leiftur.ListContactListsAsync();     // each with its number of contacts
+bool removed = await leiftur.RemoveContactAsync(list.Id, "7801512");
+bool gone = await leiftur.DeleteContactListAsync(list.Id);                       // the list and all its contacts
+```
+
+Taking someone off a contact list is not an opt-out: it only affects that list. To make sure a person is never
+contacted, add them to the [suppression list](#people-who-must-not-be-contacted-the-suppression-list).
+
+## Verification codes
+
+Proves that a person holds a phone number, for sign-up, login or confirming a change. One call sends a code,
+another checks what the person typed. Your application never sees or stores the code.
+
+```csharp
+// 1. The person enters their phone number.
+VerificationDto verification = await leiftur.StartVerificationAsync("7801512", from: "Acme");
+// They receive: Staðfestingarkóðinn þinn er 482913.
+// Keep verification.Id (in the session, for example) for the next step.
+
+// 2. The person types the code they received.
+VerificationCheckResult check = await leiftur.CheckVerificationAsync(verification.Id, typedCode);
+
+if (check.Valid)
+{
+    // The number is theirs.
+}
+else if (check.Status == VerificationStatus.Pending)
+{
+    // Wrong code. They may try again: check.AttemptsRemaining attempts are left.
+}
+else
+{
+    // Expired, locked after too many wrong codes, or replaced by a newer code. Start again.
+}
+```
+
+**Act on `check.Valid`.** It is `true` only for the one check that confirmed the code.
+
+| `Status` | Meaning |
+|---|---|
+| `Pending` | Wrong code; the person can try again |
+| `Approved` | The code was right |
+| `Failed` | Five wrong codes; this verification is locked |
+| `Expired` | The time ran out |
+| `Superseded` | A newer code was sent to the same number |
+
+To choose the text, the length or how long the code lasts:
+
+```csharp
+await leiftur.StartVerificationAsync(new StartVerificationRequest
+{
+    To = "7801512",
+    From = "Acme",
+    Message = "Acme: {{code}} er kóðinn þinn. Ekki deila honum.",   // must contain {{code}}
+    CodeLength = 4,              // 4 to 8 digits, default 6
+    ExpiresInSeconds = 600,      // 60 to 3600, default 300
+});
+
+// Or the standard text in English:
+await leiftur.StartVerificationAsync(new StartVerificationRequest { To = "7801512", From = "Acme", Language = "en" });
+// Your verification code is 482913.
+```
+
+The rules, so you know what to expect:
+
+- **Five attempts per code.** After five wrong codes the verification is locked, even if the next one is right.
+- **A code works once,** and only the newest code sent to a number works.
+- **Five codes per number per hour.** A sixth request throws `LeifturApiException` with `429 TooManyRequests`.
+  Show the person a "try again later" message; do not retry in a loop.
+- **Neither call is retried by the client.** Sending again would text the person a second code, and checking
+  again would use up another attempt. If either throws because of a network error, let the person press the
+  button again.
+- **The code is not kept anywhere you can read it.** The message's `Body` comes back empty from
+  `GetMessageAsync` and in webhook events.
+
+A verification SMS is billed like any other message and shows in reports and the statement with the tag
+`verification`.
 
 ## Schedule and cancel
 
@@ -452,11 +643,12 @@ catch (LeifturApiException ex) when (ex.StatusCode == HttpStatusCode.PaymentRequ
 
 | `StatusCode` | Meaning |
 |---|---|
-| `400 BadRequest` | Invalid field or phone number, or a country without a price |
+| `400 BadRequest` | Invalid field or phone number, a country without a price, or a placeholder with no value |
 | `401 Unauthorized` | Wrong or revoked key, or called from an IP address the key does not allow |
 | `402 PaymentRequired` | The monthly spending limit would be exceeded |
 | `403 Forbidden` | Sender name not approved, country not enabled, or the key lacks permission for this call |
-| `429 TooManyRequests` | Too many requests; only thrown after the retries are used up |
+| `409 Conflict` | A template or list with that name already exists |
+| `429 TooManyRequests` | Too many requests (thrown after the retries are used up), or too many verification codes to one number |
 
 Network errors and timeouts are retried `MaxRetries` times with increasing pauses. If they all fail, the
 original `HttpRequestException` or `TaskCanceledException` is thrown. It is safe to call `SendAsync` again after
@@ -489,6 +681,20 @@ Create one `LeifturClient` and reuse it; do not create one per message.
 | `ListMessagesAsync(MessageQuery?)` | `PagedResult<MessageDto>` | Search |
 | `GetUsageAsync(from, to, groupBy, projectId?)` | `UsageReport` | Billable usage |
 | `GetStatementAsync(year, month)` | `BillingStatement` | What the account owes for a month |
+| `CreateTemplateAsync(name, body)` | `TemplateDto` | Store a text with placeholders |
+| `ListTemplatesAsync()`, `GetTemplateAsync(id)` | `IReadOnlyList<TemplateDto>`, `TemplateDto?` | Read templates |
+| `UpdateTemplateAsync(id, name, body)` | `TemplateDto` | Change a template |
+| `DeleteTemplateAsync(id)` | `bool` | Remove a template; `false` if it does not exist |
+| `PreviewTemplateAsync(id, data?)` | `TemplatePreview` | See a template filled in, with its segment count |
+| `CreateContactListAsync(name)` | `ContactListDto` | Create a list |
+| `ListContactListsAsync()` | `IReadOnlyList<ContactListDto>` | Your lists and their sizes |
+| `DeleteContactListAsync(id)` | `bool` | Delete a list and its contacts |
+| `AddContactsAsync(listId, contacts)` | `AddContactsResponse` | Add contacts, or replace the data of existing ones |
+| `ListContactsAsync(listId, page, pageSize)` | `PagedResult<ContactDto>` | The contacts on a list |
+| `RemoveContactAsync(listId, number)` | `bool` | Take one number off a list |
+| `StartVerificationAsync(to, from)` or `(request)` | `VerificationDto` | Send a verification code |
+| `CheckVerificationAsync(id, code)` | `VerificationCheckResult` | Check the code a person typed |
+| `GetVerificationAsync(id)` | `VerificationDto?` | Status of a verification, or `null` |
 | `AddSuppressionsAsync(numbers, reason?, note?)` | `AddSuppressionsResponse` | Stop sending to numbers |
 | `ListSuppressionsAsync(page, pageSize, reason?)` | `PagedResult<SuppressionDto>` | The suppression list |
 | `GetSuppressionAsync(number)` | `SuppressionDto?` | One entry, or `null` if not listed |
@@ -504,8 +710,8 @@ Every method also takes a `CancellationToken`.
 For receiving webhooks: `LeifturWebhook.TryRead`, `LeifturWebhook.VerifySignature` and `LeifturWebhook.Parse`.
 
 Each kind of call needs an API key that is allowed to make it. The permissions are named `messages:send`,
-`messages:read`, `reports:read`, `webhooks:manage` and `suppressions:manage`; a call without the right one
-fails with `403 Forbidden`.
+`messages:read`, `reports:read`, `webhooks:manage`, `suppressions:manage`, `templates:manage`,
+`contacts:manage` and `verifications:use`; a call without the right one fails with `403 Forbidden`.
 
 ## Licence
 

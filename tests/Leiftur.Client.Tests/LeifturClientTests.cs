@@ -551,3 +551,244 @@ public class LeifturWebhookTests
         Assert.Empty(none.Events);
     }
 }
+
+public class TemplateListVerificationTests
+{
+    private sealed record Seen(HttpMethod Method, string PathAndQuery, string? Body);
+
+    private sealed class StubHandler(Func<int, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        public List<Seen> Requests { get; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests.Add(new Seen(request.Method, request.RequestUri!.PathAndQuery, request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken)));
+            return respond(Requests.Count);
+        }
+    }
+
+    private static HttpResponseMessage Json(HttpStatusCode status, string json) =>
+        new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+
+    private static (LeifturClient Client, StubHandler Handler) Create(Func<int, HttpResponseMessage> respond)
+    {
+        var handler = new StubHandler(respond);
+        var client = new LeifturClient(new HttpClient(handler), new LeifturClientOptions { BaseAddress = new Uri("https://api.example.test/"), ApiKey = "lf_test_key", MaxRetries = 2 });
+        return (client, handler);
+    }
+
+    private const string Accepted = """
+        {
+          "batchId": "019a9d2e-6f3b-7c41-9a55-0d1f6c2b8e10", "scheduledAt": null, "totalMessages": 2, "totalSegments": 2,
+          "estimatedPrice": 20, "currency": "ISK",
+          "messages": [
+            { "id": "019a9d2e-6f3c-7a02-b1d4-5e7f90ab12cd", "to": "3547801512", "countryCode": "IS", "segments": 1, "status": "Queued" },
+            { "id": "019a9d2e-6f3c-7a02-b1d4-5e7f90ab12ce", "to": "3547801513", "countryCode": "IS", "segments": 1, "status": "Queued" }
+          ],
+          "replayed": false, "suppressed": []
+        }
+        """;
+
+    private static readonly Guid Id = Guid.Parse("019a9e10-4c1d-7a55-9b02-6f7d8e9a0b1c");
+
+    private static string Template(string body = "Hæ {{name|vinur}}, pöntun {{order}} er tilbúin.") => $$"""
+        { "id": "{{Id}}", "name": "Order ready", "body": "{{body}}", "fields": ["name", "order"],
+          "createdAt": "2026-11-19T12:40:00+00:00", "updatedAt": "2026-11-19T12:40:00+00:00" }
+        """;
+
+    [Fact]
+    public async Task A_personalised_send_carries_each_recipients_values()
+    {
+        var (client, handler) = Create(_ => Json(HttpStatusCode.Accepted, Accepted));
+
+        await client.SendAsync(new SendSmsRequest
+        {
+            From = "Acme",
+            TemplateId = Id,
+            Data = new Dictionary<string, string> { ["store"] = "Kringlan" },
+            Recipients = [new SendRecipient("7801512", ("name", "Anna"), ("order", "1001")), new SendRecipient("7801513")],
+        });
+
+        using var sent = JsonDocument.Parse(handler.Requests.Single().Body!);
+        var root = sent.RootElement;
+        Assert.Equal(Id, root.GetProperty("templateId").GetGuid());
+        Assert.Equal("Kringlan", root.GetProperty("data").GetProperty("store").GetString());
+        Assert.Equal("7801512", root.GetProperty("recipients")[0].GetProperty("to").GetString());
+        Assert.Equal("Anna", root.GetProperty("recipients")[0].GetProperty("data").GetProperty("name").GetString());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("recipients")[1].GetProperty("data").ValueKind);
+        // Nothing is sent as plain "to" or "body" in this kind of request.
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("to").ValueKind);
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("body").ValueKind);
+    }
+
+    [Fact]
+    public async Task A_send_to_a_contact_list_names_the_list()
+    {
+        var (client, handler) = Create(_ => Json(HttpStatusCode.Accepted, Accepted));
+
+        await client.SendAsync(new SendSmsRequest { From = "Acme", ContactListId = Id, Body = "Hæ {{name|vinur}}" });
+
+        using var sent = JsonDocument.Parse(handler.Requests.Single().Body!);
+        Assert.Equal(Id, sent.RootElement.GetProperty("contactListId").GetGuid());
+        Assert.Equal("Hæ {{name|vinur}}", sent.RootElement.GetProperty("body").GetString());
+    }
+
+    [Fact]
+    public async Task Templates_can_be_created_read_changed_previewed_and_deleted()
+    {
+        var (client, handler) = Create(n => n switch
+        {
+            1 => Json(HttpStatusCode.Created, Template()),
+            2 => Json(HttpStatusCode.OK, $"[{Template()}]"),
+            3 => Json(HttpStatusCode.OK, Template()),
+            4 => new HttpResponseMessage(HttpStatusCode.NotFound),
+            5 => Json(HttpStatusCode.OK, Template("Pöntun {{order}} er tilbúin.")),
+            6 => Json(HttpStatusCode.OK, """{ "body": "Hæ vinur, pöntun 1001 er tilbúin.", "encoding": "Ucs2", "length": 33, "segments": 1, "missing": [] }"""),
+            7 => Json(HttpStatusCode.OK, """{ "body": "Hæ vinur, pöntun {{order}} er tilbúin.", "encoding": "Ucs2", "length": 38, "segments": 1, "missing": ["order"] }"""),
+            _ => new HttpResponseMessage(HttpStatusCode.NoContent),
+        });
+
+        var created = await client.CreateTemplateAsync("Order ready", "Hæ {{name|vinur}}, pöntun {{order}} er tilbúin.");
+        var all = await client.ListTemplatesAsync();
+        var one = await client.GetTemplateAsync(Id);
+        var none = await client.GetTemplateAsync(Guid.NewGuid());
+        var updated = await client.UpdateTemplateAsync(Id, "Order ready", "Pöntun {{order}} er tilbúin.");
+        var preview = await client.PreviewTemplateAsync(Id, new Dictionary<string, string> { ["order"] = "1001" });
+        var incomplete = await client.PreviewTemplateAsync(Id);
+        var deleted = await client.DeleteTemplateAsync(Id);
+
+        Assert.Equal(["name", "order"], created.Fields);
+        Assert.Equal((HttpMethod.Post, "/v1/templates"), (handler.Requests[0].Method, handler.Requests[0].PathAndQuery));
+        using (var body = JsonDocument.Parse(handler.Requests[0].Body!))
+        {
+            Assert.Equal("Order ready", body.RootElement.GetProperty("name").GetString());
+        }
+        Assert.Single(all);
+        Assert.Equal(Id, one!.Id);
+        Assert.Null(none);
+        Assert.Equal((HttpMethod.Put, $"/v1/templates/{Id}"), (handler.Requests[4].Method, handler.Requests[4].PathAndQuery));
+        Assert.Equal("Pöntun {{order}} er tilbúin.", updated.Body);
+        Assert.Equal($"/v1/templates/{Id}/preview", handler.Requests[5].PathAndQuery);
+        Assert.Equal(("Hæ vinur, pöntun 1001 er tilbúin.", SmsEncoding.Ucs2, 1), (preview.Body, preview.Encoding, preview.Segments));
+        Assert.Equal(["order"], incomplete.Missing);
+        Assert.True(deleted);
+    }
+
+    [Fact]
+    public async Task Contact_lists_can_be_created_filled_listed_and_emptied()
+    {
+        var list = $$"""{ "id": "{{Id}}", "name": "Newsletter", "contacts": 2, "createdAt": "2026-11-19T12:40:00+00:00" }""";
+        var (client, handler) = Create(n => n switch
+        {
+            1 => Json(HttpStatusCode.Created, list),
+            2 => Json(HttpStatusCode.OK, """{ "added": 2, "updated": 1, "invalid": ["12"] }"""),
+            3 => Json(HttpStatusCode.OK, """{ "items": [ { "number": "3547801512", "countryCode": "IS", "data": { "name": "Anna" }, "createdAt": "2026-11-19T12:41:00+00:00" } ], "page": 2, "pageSize": 1, "total": 2 }"""),
+            4 => Json(HttpStatusCode.OK, $"[{list}]"),
+            5 => new HttpResponseMessage(HttpStatusCode.NoContent),
+            6 => new HttpResponseMessage(HttpStatusCode.NotFound),
+            _ => new HttpResponseMessage(HttpStatusCode.NoContent),
+        });
+
+        var created = await client.CreateContactListAsync("Newsletter");
+        var added = await client.AddContactsAsync(Id, [new ContactInput("7801512", ("name", "Anna")), new ContactInput("+354 780 1513"), new ContactInput("12")]);
+        var page = await client.ListContactsAsync(Id, page: 2, pageSize: 1);
+        var lists = await client.ListContactListsAsync();
+        var removed = await client.RemoveContactAsync(Id, "+354 780 1512");
+        var removedAgain = await client.RemoveContactAsync(Id, "7801512");
+        var deleted = await client.DeleteContactListAsync(Id);
+
+        Assert.Equal("Newsletter", created.Name);
+        Assert.Equal($"/v1/lists/{Id}/contacts", handler.Requests[1].PathAndQuery);
+        using (var body = JsonDocument.Parse(handler.Requests[1].Body!))
+        {
+            var contacts = body.RootElement.GetProperty("contacts");
+            Assert.Equal(3, contacts.GetArrayLength());
+            Assert.Equal("Anna", contacts[0].GetProperty("data").GetProperty("name").GetString());
+        }
+        Assert.Equal((2, 1), (added.Added, added.Updated));
+        Assert.Equal(["12"], added.Invalid);
+        Assert.Equal($"/v1/lists/{Id}/contacts?page=2&pageSize=1", handler.Requests[2].PathAndQuery);
+        Assert.Equal("Anna", page.Items.Single().Data["name"]);
+        Assert.Equal(2, lists.Single().Contacts);
+        Assert.Equal((HttpMethod.Delete, $"/v1/lists/{Id}/contacts/%2B354%20780%201512"), (handler.Requests[4].Method, handler.Requests[4].PathAndQuery));
+        Assert.True(removed);
+        Assert.False(removedAgain);
+        Assert.True(deleted);
+    }
+
+    private static string Verification(string status = "Pending") => $$"""
+        { "id": "{{Id}}", "to": "3547801512", "status": "{{status}}", "expiresAt": "2026-11-19T12:50:00+00:00",
+          "attemptsRemaining": 5, "messageId": "019a9e12-7b3b-7d10-a2b3-c4d5e6f70819", "createdAt": "2026-11-19T12:45:00+00:00" }
+        """;
+
+    [Fact]
+    public async Task A_verification_is_started_checked_and_read()
+    {
+        var (client, handler) = Create(n => n switch
+        {
+            1 => Json(HttpStatusCode.Accepted, Verification()),
+            2 => Json(HttpStatusCode.OK, $$"""{ "id": "{{Id}}", "valid": false, "status": "Pending", "attemptsRemaining": 4 }"""),
+            3 => Json(HttpStatusCode.OK, $$"""{ "id": "{{Id}}", "valid": true, "status": "Approved", "attemptsRemaining": 3 }"""),
+            4 => Json(HttpStatusCode.OK, Verification("Approved")),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+
+        var started = await client.StartVerificationAsync(new StartVerificationRequest { To = "7801512", From = "Acme", Language = "en", CodeLength = 4, ExpiresInSeconds = 600 });
+        var wrong = await client.CheckVerificationAsync(Id, "0000");
+        var right = await client.CheckVerificationAsync(Id, "4829");
+        var read = await client.GetVerificationAsync(Id);
+        var missing = await client.GetVerificationAsync(Guid.NewGuid());
+
+        using (var body = JsonDocument.Parse(handler.Requests[0].Body!))
+        {
+            Assert.Equal(("7801512", "Acme", "en", 4, 600), (
+                body.RootElement.GetProperty("to").GetString(), body.RootElement.GetProperty("from").GetString(), body.RootElement.GetProperty("language").GetString(),
+                body.RootElement.GetProperty("codeLength").GetInt32(), body.RootElement.GetProperty("expiresInSeconds").GetInt32()));
+        }
+        Assert.Equal((VerificationStatus.Pending, 5, "3547801512"), (started.Status, started.AttemptsRemaining, started.To));
+        Assert.Equal($"/v1/verifications/{Id}/check", handler.Requests[1].PathAndQuery);
+        Assert.Equal("""{"code":"0000"}""", handler.Requests[1].Body);
+        Assert.Equal((false, VerificationStatus.Pending, 4), (wrong.Valid, wrong.Status, wrong.AttemptsRemaining));
+        Assert.Equal((true, VerificationStatus.Approved), (right.Valid, right.Status));
+        Assert.Equal(VerificationStatus.Approved, read!.Status);
+        Assert.Null(missing);
+    }
+
+    [Theory]
+    [InlineData("Expired")]
+    [InlineData("Failed")]
+    [InlineData("Superseded")]
+    public async Task Every_way_a_verification_can_end_is_understood(string status)
+    {
+        var (client, _) = Create(_ => Json(HttpStatusCode.OK, $$"""{ "id": "{{Id}}", "valid": false, "status": "{{status}}", "attemptsRemaining": 0 }"""));
+
+        var result = await client.CheckVerificationAsync(Id, "123456");
+
+        Assert.False(result.Valid);
+        Assert.Equal(Enum.Parse<VerificationStatus>(status), result.Status);
+    }
+
+    [Fact]
+    public async Task Sending_and_checking_a_code_are_never_retried()
+    {
+        // A retry of "send" would text the person a second code. A retry of "check" would use up another
+        // attempt, and would report a check that had in fact succeeded as not valid.
+        var (client, handler) = Create(_ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+
+        await Assert.ThrowsAsync<LeifturApiException>(() => client.StartVerificationAsync("7801512", "Acme"));
+        await Assert.ThrowsAsync<LeifturApiException>(() => client.CheckVerificationAsync(Id, "123456"));
+
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Too_many_codes_to_one_number_is_reported_as_an_error()
+    {
+        var (client, _) = Create(_ => Json(HttpStatusCode.TooManyRequests, """{ "title": "Too many requests", "status": 429, "detail": "At most 5 verification codes per number per hour." }"""));
+
+        var error = await Assert.ThrowsAsync<LeifturApiException>(() => client.StartVerificationAsync("7801512", "Acme"));
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, error.StatusCode);
+        Assert.Contains("5 verification codes", error.Message);
+    }
+}

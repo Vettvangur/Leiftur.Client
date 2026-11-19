@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <PackageId>Leiftur.Client</PackageId>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Authors>Vettvangur</Authors>
     <Description>.NET client for the Leiftur SMS API: send, schedule and track SMS messages.</Description>
     <PackageTags>sms;leiftur;iceland</PackageTags>

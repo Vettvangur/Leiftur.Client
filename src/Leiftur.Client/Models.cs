@@ -41,16 +41,36 @@ public enum SmsEncoding
     Ucs2 = 1,
 }
 
-/// <summary>Request to send one SMS body to one or more recipients, now or at a scheduled time.</summary>
+/// <summary>
+/// Request to send an SMS to one or more recipients, now or at a scheduled time.
+/// Say who it goes to with exactly one of <see cref="To"/>, <see cref="Recipients"/> or
+/// <see cref="ContactListId"/>, and what it says with either <see cref="Body"/> or <see cref="TemplateId"/>.
+/// </summary>
 public sealed record SendSmsRequest
 {
     /// <summary>Approved sender name (max 11 letters/digits) or number.</summary>
     public required string From { get; init; }
 
     /// <summary>Recipient numbers. Icelandic local numbers or international format. Max 10,000 per request.</summary>
-    public required IReadOnlyList<string> To { get; init; }
+    public IReadOnlyList<string>? To { get; init; }
 
-    public required string Body { get; init; }
+    /// <summary>
+    /// The text. When the request also has <see cref="Data"/>, <see cref="Recipients"/> or
+    /// <see cref="ContactListId"/>, placeholders such as {{name}} in it are filled in for each recipient.
+    /// </summary>
+    public string? Body { get; init; }
+
+    /// <summary>A stored template to use as the text, instead of <see cref="Body"/>.</summary>
+    public Guid? TemplateId { get; init; }
+
+    /// <summary>Recipients with their own values for the placeholders. Max 10,000 per request.</summary>
+    public IReadOnlyList<SendRecipient>? Recipients { get; init; }
+
+    /// <summary>Send to everyone on a contact list, using each contact's stored values for the placeholders.</summary>
+    public Guid? ContactListId { get; init; }
+
+    /// <summary>Placeholder values that apply to every recipient. A recipient's own value for the same name wins.</summary>
+    public IReadOnlyDictionary<string, string>? Data { get; init; }
 
     /// <summary>Free-form billing reference (e.g. customer or campaign id). Shown in reports and usable as a grouping key.</summary>
     public string? Reference { get; init; }
@@ -69,6 +89,25 @@ public sealed record SendSmsRequest
     /// webhook events. Keys up to 40 characters, values up to 200.
     /// </summary>
     public IReadOnlyDictionary<string, string>? Metadata { get; init; }
+}
+
+/// <summary>One recipient and the values for the placeholders in the text.</summary>
+public sealed record SendRecipient
+{
+    public required string To { get; init; }
+    public IReadOnlyDictionary<string, string>? Data { get; init; }
+
+    public SendRecipient()
+    {
+    }
+
+    /// <summary>For example <c>new SendRecipient("7801512", ("name", "Anna"), ("order", "1001"))</c>.</summary>
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembers]
+    public SendRecipient(string to, params (string Name, string Value)[] data)
+    {
+        To = to;
+        Data = data.Length == 0 ? null : data.ToDictionary(d => d.Name, d => d.Value);
+    }
 }
 
 public sealed record SendSmsResponse
